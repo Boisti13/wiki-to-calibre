@@ -8,6 +8,12 @@ and citation clutter stripped, no re-downloads of articles you already have.
 Built as a single Python 3 stdlib script (`http.server`, `html.parser`) — no
 `pip install` required, just Python 3 and Calibre's command-line tools.
 
+Works with any Calibre library, but pairs especially well with
+[Calibre-Web Automated](https://github.com/crocodilestick/Calibre-Web-Automated) —
+point `LIBRARY` at the same library folder CWA uses and imported articles show
+up there immediately, with CWA's own auto-conversion/metadata features layered
+on top.
+
 ## Features
 
 - Converts any `*.wikipedia.org` article to EPUB via Calibre's `ebook-convert`
