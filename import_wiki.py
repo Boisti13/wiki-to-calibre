@@ -469,13 +469,13 @@ pre{{white-space:pre-wrap;background:#f4f4f4;padding:8px;font-size:12px}}
 table.catalog{{width:100%;border-collapse:collapse;margin-top:12px;font-size:14px}}
 table.catalog th,table.catalog td{{padding:6px 4px;border-bottom:1px solid #ddd;text-align:left}}
 table.catalog td.actions{{text-align:right;white-space:nowrap}}
-table.catalog form{{margin:0;display:inline}}
 button.del{{background:none;border:none;color:#c00;cursor:pointer;font-size:13px;padding:2px 6px}}
 button.del:hover{{text-decoration:underline}}
 button.refresh{{background:none;border:none;color:#06c;cursor:pointer;font-size:13px;padding:2px 6px}}
 button.refresh:hover{{text-decoration:underline}}
-.catalog-header{{display:flex;justify-content:space-between;align-items:baseline;margin-top:24px}}
-button.refresh-all{{font-size:13px;padding:4px 10px;margin-top:0}}
+.catalog-header{{display:flex;justify-content:space-between;align-items:baseline;margin-top:24px;flex-wrap:wrap;gap:8px}}
+.bulk-actions button{{font-size:13px;padding:4px 10px;margin-top:0;margin-left:6px}}
+.bulk-actions button.del-all,.bulk-actions button.del-sel{{color:#c00;border-color:#c00}}
 .options{{margin-top:8px;font-size:14px;color:#444}}
 .options label{{margin-right:16px;white-space:nowrap}}
 .options input{{margin-right:4px}}
@@ -491,13 +491,18 @@ button.refresh-all{{font-size:13px;padding:4px 10px;margin-top:0}}
 <button type="submit">Import</button>
 </form>
 {message}
+<form method="POST" action="/refresh_all" id="catalogForm">
 <div class="catalog-header">
 <h3>Imported Articles ({count})</h3>
-<form method="POST" action="/refresh_all" onsubmit="return confirm('Re-fetch and update all {count} articles? This may take a while.')">
-<button type="submit" class="refresh-all">Update All Articles</button>
-</form>
+<div class="bulk-actions">
+<button type="submit" formaction="/bulk_refresh" onclick="return confirm('Update the selected articles?')">Update Selected</button>
+<button type="submit" formaction="/bulk_delete" class="del-sel" onclick="return confirm('Delete the selected articles?')">Delete Selected</button>
+<button type="submit" formaction="/refresh_all" onclick="return confirm('Update ALL {count} articles? This may take a while.')">Update All</button>
+<button type="submit" formaction="/delete_all" class="del-all" onclick="return confirm('Delete ALL {count} articles? This cannot be undone.')">Delete All</button>
+</div>
 </div>
 {catalog}
+</form>
 </body></html>"""
 
 
@@ -511,23 +516,22 @@ def render_catalog():
         size = human_size(r.get("size"))
         items.append(
             "<tr>"
+            f'<td><input type="checkbox" name="ids" value="{r["id"]}"></td>'
             f'<td>{html.escape(r["title"])}</td>'
             f"<td>{date}</td>"
             f"<td>{size}</td>"
             '<td class="actions">'
-            '<form method="POST" action="/refresh">'
-            f'<input type="hidden" name="id" value="{r["id"]}">'
-            '<button type="submit" class="refresh">Refresh</button>'
-            "</form> "
-            '<form method="POST" action="/delete" onsubmit="return confirm(\'Delete this article?\')">'
-            f'<input type="hidden" name="id" value="{r["id"]}">'
-            '<button type="submit" class="del">Delete</button>'
-            "</form>"
+            f'<button type="submit" formaction="/refresh" name="id" value="{r["id"]}" class="refresh">Refresh</button> '
+            f'<button type="submit" formaction="/delete" name="id" value="{r["id"]}" class="del" '
+            'onclick="return confirm(\'Delete this article?\')">Delete</button>'
             "</td>"
             "</tr>"
         )
     table = (
-        '<table class="catalog"><tr><th>Title</th><th>Added</th><th>Size</th><th></th></tr>'
+        '<table class="catalog">'
+        '<tr><th><input type="checkbox" '
+        "onclick=\"document.querySelectorAll('.catalog input[name=ids]').forEach(cb=>cb.checked=this.checked)\">"
+        "</th><th>Title</th><th>Added</th><th>Size</th><th></th></tr>"
         + "".join(items)
         + "</table>"
     )
@@ -563,6 +567,15 @@ class Handler(BaseHTTPRequestHandler):
             return
         if self.path == "/refresh_all":
             self._handle_refresh_all()
+            return
+        if self.path == "/delete_all":
+            self._handle_delete_all()
+            return
+        if self.path == "/bulk_delete":
+            self._handle_bulk("delete")
+            return
+        if self.path == "/bulk_refresh":
+            self._handle_bulk("refresh")
             return
         if self.path != "/import":
             self._send(404, "Not found")
@@ -639,6 +652,44 @@ class Handler(BaseHTTPRequestHandler):
             )
         else:
             msg = f'<p style="color:green">Updated all {ok} article(s).</p>'
+        self._send(200, render_page(msg))
+
+    def _handle_delete_all(self):
+        rows = list_wikipedia_articles()
+        ok, failed = 0, 0
+        for r in rows:
+            try:
+                delete_article(r["id"])
+                ok += 1
+            except Exception:
+                failed += 1
+        msg = f'<p style="color:green">Deleted {ok} article(s).</p>'
+        if failed:
+            msg += f'<p style="color:red">{failed} failed to delete.</p>'
+        self._send(200, render_page(msg))
+
+    def _handle_bulk(self, action):
+        length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(length).decode("utf-8")
+        ids = [i for i in urllib.parse.parse_qs(body).get("ids", []) if i.isdigit() and is_wikipedia_article(i)]
+        if not ids:
+            self._send(200, render_page('<p style="color:#b8860b">No articles were selected.</p>'))
+            return
+        ok, failed = 0, []
+        for book_id in ids:
+            try:
+                if action == "delete":
+                    delete_article(book_id)
+                else:
+                    refresh_article(book_id)
+                ok += 1
+            except Exception:
+                failed.append(book_id)
+        verb = "Deleted" if action == "delete" else "Updated"
+        if failed:
+            msg = f'<p style="color:#b8860b">{verb} {ok} article(s), {len(failed)} failed.</p>'
+        else:
+            msg = f'<p style="color:green">{verb} {ok} selected article(s).</p>'
         self._send(200, render_page(msg))
 
     def log_message(self, fmt, *args):
