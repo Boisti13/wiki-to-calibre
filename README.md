@@ -26,9 +26,23 @@ Built as a single Python 3 stdlib script (`http.server`, `html.parser`) — no
 
 - Python 3.9+
 - Calibre installed with `ebook-convert` and `calibredb` on `PATH`
-- A Calibre library (a folder containing `metadata.db`)
+- A Calibre library (a folder containing `metadata.db`, created automatically
+  on first import if it doesn't exist yet)
 
-## Usage
+## Quick install
+
+Interactive installer — checks for Python/Calibre (offers to `apt install`
+calibre if missing), asks for your library path/port, and optionally sets up
+a systemd service:
+
+```bash
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/Boisti13/wiki-to-calibre/master/install.sh)"
+```
+
+Or clone the repo first and run `./install.sh` locally — it detects the local
+`import_wiki.py` and uses that instead of fetching it from GitHub.
+
+## Manual setup
 
 Edit the three constants at the top of `import_wiki.py`:
 
