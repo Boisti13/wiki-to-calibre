@@ -14,6 +14,8 @@ point `LIBRARY` at the same library folder CWA uses and imported articles show
 up there immediately, with CWA's own auto-conversion/metadata features layered
 on top.
 
+![Screenshot of the catalog view, showing the import form and a list of imported articles with per-article and bulk actions](screenshot.png)
+
 ## Features
 
 - Converts any `*.wikipedia.org` article to EPUB via Calibre's `ebook-convert`
