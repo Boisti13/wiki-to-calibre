@@ -227,10 +227,13 @@ def list_wikipedia_articles():
     result = subprocess.run(
         ["calibredb", "list", f"--with-library={LIBRARY}",
          "--search", "tags:Wikipedia",
-         "--fields", "id,title,timestamp,size", "--for-machine"],
+         "--fields", "id,title,timestamp,size,identifiers", "--for-machine"],
         capture_output=True, text=True, check=True,
     )
     rows = json.loads(result.stdout or "[]")
+    for r in rows:
+        wiki = (r.get("identifiers") or {}).get("wikipedia")
+        r["lang"] = wiki.split(":", 1)[0] if wiki and ":" in wiki else "en"
     rows.sort(key=lambda r: r.get("timestamp") or "", reverse=True)
     return rows
 
@@ -518,6 +521,7 @@ def render_catalog():
             "<tr>"
             f'<td><input type="checkbox" name="ids" value="{r["id"]}"></td>'
             f'<td>{html.escape(r["title"])}</td>'
+            f'<td>{html.escape(r["lang"])}</td>'
             f"<td>{date}</td>"
             f"<td>{size}</td>"
             '<td class="actions">'
@@ -531,7 +535,7 @@ def render_catalog():
         '<table class="catalog">'
         '<tr><th><input type="checkbox" '
         "onclick=\"document.querySelectorAll('.catalog input[name=ids]').forEach(cb=>cb.checked=this.checked)\">"
-        "</th><th>Title</th><th>Added</th><th>Size</th><th></th></tr>"
+        "</th><th>Title</th><th>Lang</th><th>Added</th><th>Size</th><th></th></tr>"
         + "".join(items)
         + "</table>"
     )
