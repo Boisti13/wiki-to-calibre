@@ -626,6 +626,13 @@ h1 {{ font-size: 1.5rem; margin: 0 0 20px; }}
 h2 {{ font-size: 1.1rem; margin: 0 0 14px; }}
 .card {{ background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 20px; margin-bottom: 20px; }}
 .muted {{ color: var(--muted); font-size: 0.85rem; }}
+.about {{ margin-top: 8px; padding-top: 14px; border-top: 1px solid var(--border); font-size: 0.78rem; color: var(--muted); }}
+.about p {{ margin: 0; }}
+.about a {{ color: var(--muted); }}
+.about code {{ font-size: 0.9em; }}
+.about .msg {{ font-size: 0.78rem; padding: 6px 10px; margin-top: 8px; }}
+.about .btn-row {{ margin-top: 8px; }}
+.about .btn {{ padding: 4px 10px; font-size: 0.75rem; }}
 input[type=url] {{
   width: 100%; padding: 9px 10px; font-size: 15px;
   border: 1px solid var(--border); border-radius: 6px;
@@ -764,11 +771,12 @@ def render_about(about_message=""):
             "</div>"
         )
 
+    github_link = f'<a href="{GITHUB_URL}" target="_blank" rel="noopener">wiki-to-calibre on GitHub</a>'
+    summary_line = f"{github_link} &middot; {version_line}" if version_line else github_link
+
     return (
-        '<div class="card" id="about">'
-        "<h2>About</h2>"
-        f'<p class="muted"><a href="{GITHUB_URL}" target="_blank" rel="noopener">wiki-to-calibre on GitHub</a></p>'
-        f'<p class="muted" style="margin-top:8px">{version_line}</p>'
+        '<div class="about" id="about">'
+        f"<p>{summary_line}</p>"
         f"{about_message}"
         f"{update_controls}"
         "</div>"
