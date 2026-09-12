@@ -516,45 +516,70 @@ def _get_app_version():
 APP_VERSION = _get_app_version()
 
 
-def check_for_update():
+def list_remote_branches():
+    """Branches known from the last fetch (not a network call itself)."""
+    ok, out = _run_git(["branch", "-r", "--format=%(refname:short)"])
+    if not ok:
+        return []
+    branches = []
+    for line in out.strip().splitlines():
+        line = line.strip()
+        if line.startswith("origin/") and line != "origin/HEAD":
+            branches.append(line[len("origin/"):])
+    return branches
+
+
+def _fetch_all():
+    return _run_git(["fetch", "origin", "--prune"])
+
+
+def check_for_update(branch):
     """Returns (category, message) for display in the About card. Never raises."""
     if APP_VERSION["commit"] is None:
         return "error", "Not a git checkout -- can't check for updates."
-    branch = APP_VERSION["branch"]
-    ok, out = _run_git(["fetch", "origin", branch])
+    ok, out = _fetch_all()
     if not ok:
         return "error", "Could not reach GitHub to check for updates: " + out[-300:]
+    if branch not in list_remote_branches():
+        return "error", f"Unknown branch '{branch}'."
     ok, count_out = _run_git(["rev-list", "--count", f"HEAD..origin/{branch}"])
     if not ok:
         return "error", "Could not determine update status: " + count_out[-300:]
     n = int(count_out.strip() or "0")
     if n == 0:
-        return "success", "Already up to date."
+        if branch == APP_VERSION["branch"]:
+            return "success", "Already up to date."
+        return "success", f"{branch} has no commits beyond what's already running."
     _, log = _run_git(["log", "--oneline", f"HEAD..origin/{branch}"])
     titles = log.strip().splitlines()
     summary = " | ".join(titles[:5])
     if len(titles) > 5:
         summary += " | …"
-    return "info", f"{n} update{'s' if n != 1 else ''} available on {branch}: {summary}"
+    return "info", f"{n} commit{'s' if n != 1 else ''} on {branch} not yet running: {summary}"
 
 
-def apply_update():
-    """Pulls the latest commit for the current branch. Returns (category, message, restarted)."""
+def apply_update(branch):
+    """Pulls the latest commit for `branch`, switching to it first if it isn't
+    the one currently running. Returns (category, message, restarted)."""
     if APP_VERSION["commit"] is None:
         return "error", "Not a git checkout -- can't auto-update.", False
-    branch = APP_VERSION["branch"]
-    ok, out = _run_git(["fetch", "origin", branch])
+    ok, out = _fetch_all()
     if not ok:
         return "error", "Update failed: could not reach GitHub. " + out[-300:], False
-    ok, count_out = _run_git(["rev-list", "--count", f"HEAD..origin/{branch}"])
+    if branch not in list_remote_branches():
+        return "error", f"Unknown branch '{branch}'.", False
+    same_branch = branch == APP_VERSION["branch"]
+    if same_branch:
+        ok, count_out = _run_git(["rev-list", "--count", f"HEAD..origin/{branch}"])
+        if not ok:
+            return "error", "Update failed: could not determine update status. " + count_out[-300:], False
+        if int(count_out.strip() or "0") == 0:
+            return "success", "Already up to date -- nothing to do.", False
+    ok, out = _run_git(["checkout", "-B", branch, f"origin/{branch}"])
     if not ok:
-        return "error", "Update failed: could not determine update status. " + count_out[-300:], False
-    if int(count_out.strip() or "0") == 0:
-        return "success", "Already up to date -- nothing to do.", False
-    ok, out = _run_git(["reset", "--hard", f"origin/{branch}"])
-    if not ok:
-        return "error", "Update failed while resetting to the latest version. " + out[-300:], False
-    return "success", "Updated — restarting now. Give it a few seconds, then reload.", True
+        return "error", "Update failed while switching to the latest version. " + out[-300:], False
+    verb = "Updated" if same_branch else f"Switched to {branch}"
+    return "success", f"{verb} — restarting now. Give it a few seconds, then reload.", True
 
 
 def _trigger_restart():
@@ -635,8 +660,12 @@ h2 {{ font-size: 1.1rem; margin: 0 0 14px; }}
 .about a {{ color: var(--muted); }}
 .about code {{ font-size: 0.9em; }}
 .about .msg {{ font-size: 0.78rem; padding: 6px 10px; margin-top: 8px; }}
-.about .btn-row {{ margin-top: 8px; justify-content: center; }}
+.about .btn-row {{ margin-top: 8px; justify-content: center; align-items: center; }}
 .about .btn {{ padding: 4px 10px; font-size: 0.75rem; }}
+.about select {{
+  padding: 3px 6px; font-size: 0.75rem; border-radius: 6px;
+  border: 1px solid var(--border); background: var(--card); color: var(--text);
+}}
 input[type=url] {{
   width: 100%; padding: 9px 10px; font-size: 15px;
   border: 1px solid var(--border); border-radius: 6px;
@@ -760,18 +789,22 @@ def render_about(about_message=""):
 
     update_controls = ""
     if v["commit"]:
-        branch_js = html.escape(json.dumps(v["branch"] or ""), quote=True)
+        branches = list_remote_branches()
+        if v["branch"] and v["branch"] not in branches:
+            branches.append(v["branch"])
+        options = "".join(
+            f'<option value="{html.escape(b)}"{" selected" if b == v["branch"] else ""}>{html.escape(b)}</option>'
+            for b in branches
+        )
         update_controls = (
-            '<div class="btn-row">'
-            '<form method="POST" action="/update/check#about">'
-            '<button class="btn secondary" type="submit">Check for updates</button>'
+            '<form class="btn-row" method="POST">'
+            f'<select name="branch">{options}</select>'
+            '<button type="submit" formaction="/update/check#about" class="btn secondary">Check for updates</button>'
+            '<button type="submit" formaction="/update/apply#about" class="btn" '
+            "onclick=\"return confirm('Switch to and pull the latest ' + this.form.branch.value + "
+            "' now? The app will be briefly unavailable while it restarts.');\">"
+            "Update now</button>"
             "</form>"
-            '<form method="POST" action="/update/apply#about" '
-            "onsubmit=\"return confirm('Pull the latest ' + " + branch_js + " + "
-            "' and restart the service now? The app will be briefly unavailable while it restarts.');\">"
-            '<button class="btn" type="submit">Update now</button>'
-            "</form>"
-            "</div>"
         )
 
     github_link = f'<a href="{GITHUB_URL}" target="_blank" rel="noopener">wiki-to-calibre on GitHub</a>'
@@ -940,12 +973,20 @@ class Handler(BaseHTTPRequestHandler):
             msg = _msg("success", f"{verb} {ok} selected article(s).")
         self._send(200, render_page(msg))
 
+    def _read_branch_field(self):
+        length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(length).decode("utf-8") if length else ""
+        fallback = APP_VERSION["branch"] or ""
+        return (urllib.parse.parse_qs(body).get("branch") or [fallback])[0].strip() or fallback
+
     def _handle_update_check(self):
-        category, text = check_for_update()
+        branch = self._read_branch_field()
+        category, text = check_for_update(branch)
         self._send(200, render_page(about_message=_msg(category, html.escape(text))))
 
     def _handle_update_apply(self):
-        category, text, should_restart = apply_update()
+        branch = self._read_branch_field()
+        category, text, should_restart = apply_update(branch)
         self._send(200, render_page(about_message=_msg(category, html.escape(text))))
         if should_restart:
             threading.Timer(1.0, _trigger_restart).start()
