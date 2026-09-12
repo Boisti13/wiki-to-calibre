@@ -502,13 +502,12 @@ def _read_version_file():
 def _get_app_version():
     version = _read_version_file()
     if not os.path.isdir(os.path.join(APP_DIR, ".git")):
-        return {"version": version, "branch": None, "commit": None, "message": ""}
+        return {"version": version, "branch": None, "commit": None}
     ok, commit = _run_git(["rev-parse", "--short", "HEAD"])
     if not ok:
-        return {"version": version, "branch": None, "commit": None, "message": ""}
+        return {"version": version, "branch": None, "commit": None}
     _, branch = _run_git(["rev-parse", "--abbrev-ref", "HEAD"])
-    _, message = _run_git(["log", "-1", "--pretty=%s"])
-    return {"version": version, "branch": branch.strip(), "commit": commit.strip(), "message": message.strip()}
+    return {"version": version, "branch": branch.strip(), "commit": commit.strip()}
 
 
 # Computed once at process start -- there's no reloader here, "Update now"
@@ -620,18 +619,23 @@ body {{
   background: var(--bg);
   color: var(--text);
   margin: 0;
+  min-height: 100vh;
+  display: flex;
 }}
-.wrap {{ max-width: 720px; margin: 0 auto; padding: 32px 16px 64px; }}
+.wrap {{
+  max-width: 720px; width: 100%; margin: 0 auto; padding: 32px 16px 64px;
+  display: flex; flex-direction: column; flex: 1;
+}}
 h1 {{ font-size: 1.5rem; margin: 0 0 20px; }}
 h2 {{ font-size: 1.1rem; margin: 0 0 14px; }}
 .card {{ background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 20px; margin-bottom: 20px; }}
 .muted {{ color: var(--muted); font-size: 0.85rem; }}
-.about {{ margin-top: 8px; padding-top: 14px; border-top: 1px solid var(--border); font-size: 0.78rem; color: var(--muted); }}
+.about {{ margin-top: auto; padding-top: 14px; border-top: 1px solid var(--border); font-size: 0.78rem; color: var(--muted); text-align: center; }}
 .about p {{ margin: 0; }}
 .about a {{ color: var(--muted); }}
 .about code {{ font-size: 0.9em; }}
 .about .msg {{ font-size: 0.78rem; padding: 6px 10px; margin-top: 8px; }}
-.about .btn-row {{ margin-top: 8px; }}
+.about .btn-row {{ margin-top: 8px; justify-content: center; }}
 .about .btn {{ padding: 4px 10px; font-size: 0.75rem; }}
 input[type=url] {{
   width: 100%; padding: 9px 10px; font-size: 15px;
@@ -747,10 +751,9 @@ def render_about(about_message=""):
     version_line = f"Version <strong>{html.escape(v['version'])}</strong>" if v["version"] else ""
     if v["commit"]:
         sep = " &middot; " if version_line else ""
-        subject = f" &mdash; {html.escape(v['message'])}" if v["message"] else ""
         version_line += (
             f"{sep}Running <strong>{html.escape(v['branch'])}</strong> "
-            f"@ <code>{html.escape(v['commit'])}</code>{subject}"
+            f"@ <code>{html.escape(v['commit'])}</code>"
         )
     elif not v["version"]:
         version_line = "Not installed from a git checkout &mdash; updates aren't available here."

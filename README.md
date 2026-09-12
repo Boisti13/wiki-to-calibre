@@ -14,7 +14,7 @@ point `LIBRARY` at the same library folder CWA uses and imported articles show
 up there immediately, with CWA's own auto-conversion/metadata features layered
 on top.
 
-![Screenshot of the catalog view, showing the import form and a list of imported articles with per-article and bulk actions](screenshot.png)
+![Screenshot of the app, showing the import form, a catalog of imported articles with per-article and bulk actions, and the About footer with version info and update controls](screenshot.png)
 
 ## Features
 
