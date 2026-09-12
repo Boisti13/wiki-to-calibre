@@ -690,6 +690,10 @@ button.link:hover {{ text-decoration: underline; }}
 table.catalog {{ width: 100%; border-collapse: collapse; margin-top: 14px; font-size: 0.88rem; }}
 table.catalog th, table.catalog td {{ padding: 8px 6px; border-bottom: 1px solid var(--border); text-align: left; }}
 table.catalog td.actions {{ text-align: right; white-space: nowrap; }}
+.pager {{ margin-top: 14px; display: flex; justify-content: center; align-items: center; gap: 14px; font-size: 0.85rem; }}
+.pager a {{ color: var(--accent); text-decoration: none; }}
+.pager a:hover {{ text-decoration: underline; }}
+.pager .disabled {{ color: var(--muted); opacity: 0.5; }}
 .msg {{ padding: 10px 14px; border-radius: 6px; margin-top: 16px; font-size: 0.9rem; }}
 .msg.success {{ background: var(--success-bg); color: var(--success); border: 1px solid var(--success-border); }}
 .msg.error {{ background: var(--error-bg); color: var(--danger); border: 1px solid var(--error-border); }}
@@ -718,6 +722,7 @@ code {{ background: var(--bg); padding: 1px 5px; border-radius: 4px; font-size: 
 
 <div class="card">
 <form method="POST" action="/refresh_all" id="catalogForm">
+<input type="hidden" name="page" value="{page}">
 <div class="catalog-header">
 <h2>Imported Articles ({count})</h2>
 <div class="btn-row">
@@ -728,6 +733,7 @@ code {{ background: var(--bg); padding: 1px 5px; border-radius: 4px; font-size: 
 </div>
 </div>
 {catalog}
+{pager}
 </form>
 </div>
 
@@ -742,12 +748,25 @@ def _msg(category, body_html):
     return f'<div class="msg {category}">{body_html}</div>'
 
 
-def render_catalog():
+def _parse_page(values):
+    """values is the list a parse_qs()/parse_qs().get() lookup returns (or None)."""
+    value = (values or ["1"])[0]
+    return int(value) if value.isdigit() else 1
+
+
+CATALOG_PAGE_SIZE = 20
+
+
+def render_catalog(page=1):
     rows = list_wikipedia_articles()
+    total = len(rows)
     if not rows:
-        return "<p><i>No articles imported yet.</i></p>", 0
+        return "<p><i>No articles imported yet.</i></p>", 0, 1, 1
+    total_pages = max(1, (total + CATALOG_PAGE_SIZE - 1) // CATALOG_PAGE_SIZE)
+    page = max(1, min(page, total_pages))
+    start = (page - 1) * CATALOG_PAGE_SIZE
     items = []
-    for r in rows:
+    for r in rows[start:start + CATALOG_PAGE_SIZE]:
         date = (r.get("timestamp") or "")[:10]
         size = human_size(r.get("size"))
         items.append(
@@ -772,7 +791,21 @@ def render_catalog():
         + "".join(items)
         + "</table>"
     )
-    return table, len(rows)
+    return table, total, page, total_pages
+
+
+def render_pager(page, total_pages):
+    if total_pages <= 1:
+        return ""
+    prev_link = f'<a href="/?page={page - 1}">&laquo; Prev</a>' if page > 1 else '<span class="disabled">&laquo; Prev</span>'
+    next_link = f'<a href="/?page={page + 1}">Next &raquo;</a>' if page < total_pages else '<span class="disabled">Next &raquo;</span>'
+    return (
+        '<div class="pager">'
+        f"{prev_link}"
+        f'<span class="muted">Page {page} of {total_pages}</span>'
+        f"{next_link}"
+        "</div>"
+    )
 
 
 def render_about(about_message=""):
@@ -819,10 +852,13 @@ def render_about(about_message=""):
     )
 
 
-def render_page(message="", about_message=""):
-    catalog_html, count = render_catalog()
+def render_page(message="", about_message="", page=1):
+    catalog_html, count, page, total_pages = render_catalog(page)
+    pager_html = render_pager(page, total_pages)
     about_html = render_about(about_message)
-    return PAGE.format(message=message, catalog=catalog_html, count=count, about=about_html)
+    return PAGE.format(
+        message=message, catalog=catalog_html, count=count, page=page, pager=pager_html, about=about_html
+    )
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -835,8 +871,10 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
-        if self.path == "/" or self.path.startswith("/?"):
-            self._send(200, render_page())
+        parsed = urllib.parse.urlparse(self.path)
+        if parsed.path == "/":
+            page = _parse_page(urllib.parse.parse_qs(parsed.query).get("page"))
+            self._send(200, render_page(page=page))
         else:
             self._send(404, "Not found")
 
@@ -897,45 +935,55 @@ class Handler(BaseHTTPRequestHandler):
     def _handle_delete(self):
         length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(length).decode("utf-8")
-        book_id = (urllib.parse.parse_qs(body).get("id") or [""])[0].strip()
+        fields = urllib.parse.parse_qs(body)
+        book_id = (fields.get("id") or [""])[0].strip()
+        page = _parse_page(fields.get("page"))
         try:
             if not book_id.isdigit() or not is_wikipedia_article(book_id):
                 raise ValueError("Not a Wikipedia import (refusing to delete)")
             delete_article(book_id)
-            self._send(200, render_page(_msg("success", "Article deleted.")))
+            self._send(200, render_page(_msg("success", "Article deleted."), page=page))
         except subprocess.CalledProcessError as e:
             err = (e.stderr or str(e))[-2000:]
             msg = f"Delete failed:<pre>{html.escape(err)}</pre>"
-            self._send(500, render_page(_msg("error", msg)))
+            self._send(500, render_page(_msg("error", msg), page=page))
         except Exception as e:
-            self._send(400, render_page(_msg("error", f"Delete failed: {html.escape(str(e))}")))
+            self._send(400, render_page(_msg("error", f"Delete failed: {html.escape(str(e))}"), page=page))
 
     def _handle_refresh(self):
         length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(length).decode("utf-8")
-        book_id = (urllib.parse.parse_qs(body).get("id") or [""])[0].strip()
+        fields = urllib.parse.parse_qs(body)
+        book_id = (fields.get("id") or [""])[0].strip()
+        page = _parse_page(fields.get("page"))
         try:
             if not book_id.isdigit() or not is_wikipedia_article(book_id):
                 raise ValueError("Not a Wikipedia import (refusing to refresh)")
             title = refresh_article(book_id)
-            self._send(200, render_page(_msg("success", f"Refreshed &quot;{html.escape(title)}&quot;")))
+            self._send(200, render_page(_msg("success", f"Refreshed &quot;{html.escape(title)}&quot;"), page=page))
         except subprocess.CalledProcessError as e:
             err = (e.stderr or str(e))[-2000:]
             msg = f"Refresh failed:<pre>{html.escape(err)}</pre>"
-            self._send(500, render_page(_msg("error", msg)))
+            self._send(500, render_page(_msg("error", msg), page=page))
         except Exception as e:
-            self._send(400, render_page(_msg("error", f"Refresh failed: {html.escape(str(e))}")))
+            self._send(400, render_page(_msg("error", f"Refresh failed: {html.escape(str(e))}"), page=page))
 
     def _handle_refresh_all(self):
+        length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(length).decode("utf-8") if length else ""
+        page = _parse_page(urllib.parse.parse_qs(body).get("page"))
         ok, failed = refresh_all_articles()
         if failed:
             names = ", ".join(html.escape(t) for t in failed)
             msg = _msg("warn", f"Updated {ok} article(s), {len(failed)} failed: {names}")
         else:
             msg = _msg("success", f"Updated all {ok} article(s).")
-        self._send(200, render_page(msg))
+        self._send(200, render_page(msg, page=page))
 
     def _handle_delete_all(self):
+        length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(length).decode("utf-8") if length else ""
+        page = _parse_page(urllib.parse.parse_qs(body).get("page"))
         rows = list_wikipedia_articles()
         ok, failed = 0, 0
         for r in rows:
@@ -947,14 +995,16 @@ class Handler(BaseHTTPRequestHandler):
         msg = _msg("success", f"Deleted {ok} article(s).")
         if failed:
             msg += _msg("error", f"{failed} failed to delete.")
-        self._send(200, render_page(msg))
+        self._send(200, render_page(msg, page=page))
 
     def _handle_bulk(self, action):
         length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(length).decode("utf-8")
-        ids = [i for i in urllib.parse.parse_qs(body).get("ids", []) if i.isdigit() and is_wikipedia_article(i)]
+        fields = urllib.parse.parse_qs(body)
+        page = _parse_page(fields.get("page"))
+        ids = [i for i in fields.get("ids", []) if i.isdigit() and is_wikipedia_article(i)]
         if not ids:
-            self._send(200, render_page(_msg("warn", "No articles were selected.")))
+            self._send(200, render_page(_msg("warn", "No articles were selected."), page=page))
             return
         ok, failed = 0, []
         for book_id in ids:
@@ -971,7 +1021,7 @@ class Handler(BaseHTTPRequestHandler):
             msg = _msg("warn", f"{verb} {ok} article(s), {len(failed)} failed.")
         else:
             msg = _msg("success", f"{verb} {ok} selected article(s).")
-        self._send(200, render_page(msg))
+        self._send(200, render_page(msg, page=page))
 
     def _read_branch_field(self):
         length = int(self.headers.get("Content-Length", 0))

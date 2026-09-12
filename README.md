@@ -26,13 +26,15 @@ on top.
   French section headings; warns if the article is in another language
 - Optional inline images (downloaded and embedded, off by default)
 - Skips re-importing an article that's already in the library
-- A catalog view of everything imported, with per-article delete
+- A catalog view of everything imported, with per-article delete, paginated
+  20 articles per page once the library grows past that
 - Per-article and bulk "refresh" (re-fetch + re-convert in place), remembering
   each article's image/reference options from its original import
 - An About section showing the current version number plus exactly which
-  branch and commit is running, with a "Check for updates" button and an
-  "Update now" button that pulls the latest code for whichever branch you're
-  on and restarts itself — no SSH session required for routine updates
+  branch and commit is running, with a branch picker and "Check for updates"
+  / "Update now" buttons that pull the latest code for whichever branch you
+  select and restart the service — no SSH session required for routine
+  updates or switching branches
 
 ## Requirements
 
