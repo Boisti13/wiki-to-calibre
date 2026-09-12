@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Interactive installer for wiki-to-calibre.
 # Works either from a cloned repo (./install.sh) or piped straight from GitHub:
-#   bash -c "$(curl -fsSL https://raw.githubusercontent.com/Boisti13/wiki-to-calibre/master/install.sh)"
+#   bash -c "$(curl -fsSL https://raw.githubusercontent.com/Boisti13/wiki-to-calibre/main/install.sh)"
 set -euo pipefail
 
-RAW_URL="https://raw.githubusercontent.com/Boisti13/wiki-to-calibre/master/import_wiki.py"
+REPO_URL="https://github.com/Boisti13/wiki-to-calibre.git"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd || true)"
 
 # Reading from /dev/tty makes prompts work even when this script is itself
@@ -35,6 +35,23 @@ if ! command -v python3 >/dev/null 2>&1; then
 fi
 echo "Found: $(python3 --version)"
 
+if ! command -v git >/dev/null 2>&1; then
+    echo
+    echo "git was not found. It's needed so the installed copy can check for and"
+    echo "apply updates (About section's \"Check for updates\" / \"Update now\")."
+    if confirm "Install git now via apt?"; then
+        if [ "$(id -u)" -ne 0 ]; then
+            echo "Installing git needs root. Re-run this installer with sudo, or install git yourself first." >&2
+            exit 1
+        fi
+        apt-get update -qq
+        apt-get install -y git
+    else
+        echo "git is required -- install it and re-run this installer." >&2
+        exit 1
+    fi
+fi
+
 if ! command -v ebook-convert >/dev/null 2>&1 || ! command -v calibredb >/dev/null 2>&1; then
     echo
     echo "Calibre's command-line tools (ebook-convert, calibredb) were not found on PATH."
@@ -63,26 +80,31 @@ PORT="$(ask "Port to serve the importer on" "8084")"
 LIBRARY_URL="$(ask "URL of your Calibre/Calibre-Web instance (shown as a link after each import)" "http://localhost:8083")"
 INSTALL_DIR="$(ask "Install directory" "/opt/wiki-to-calibre")"
 
-mkdir -p "$INSTALL_DIR"
-if [ -n "$SCRIPT_DIR" ] && [ -f "$SCRIPT_DIR/import_wiki.py" ]; then
-    cp "$SCRIPT_DIR/import_wiki.py" "$INSTALL_DIR/import_wiki.py"
-else
-    echo "Fetching import_wiki.py from GitHub..."
-    curl -fsSL "$RAW_URL" -o "$INSTALL_DIR/import_wiki.py"
+# The install directory is always a real git checkout, tracking whichever
+# branch it ends up on -- that's what lets the About section's "Update now"
+# button work later (a plain `git fetch` + `reset --hard`). None of the
+# LIBRARY/PORT/LIBRARY_URL settings above ever get written into the checked-
+# out source: they're passed as environment variables in the systemd unit
+# below, so an update can never wipe them.
+if [ -d "$INSTALL_DIR/.git" ]; then
+    echo
+    echo "Existing install found at $INSTALL_DIR -- pulling the latest for its current branch..."
+    BRANCH="$(git -C "$INSTALL_DIR" rev-parse --abbrev-ref HEAD)"
+    git -C "$INSTALL_DIR" fetch origin "$BRANCH"
+    git -C "$INSTALL_DIR" reset --hard "origin/$BRANCH"
+elif [ -n "$SCRIPT_DIR" ] && [ -d "$SCRIPT_DIR/.git" ] && [ "$SCRIPT_DIR" != "$INSTALL_DIR" ]; then
+    echo
+    echo "Installing from the local clone at $SCRIPT_DIR..."
+    mkdir -p "$INSTALL_DIR"
+    cp -r "$SCRIPT_DIR/." "$INSTALL_DIR/"
+elif [ "$SCRIPT_DIR" != "$INSTALL_DIR" ]; then
+    echo
+    echo "Cloning wiki-to-calibre into $INSTALL_DIR..."
+    git clone "$REPO_URL" "$INSTALL_DIR"
 fi
 
-python3 - "$INSTALL_DIR/import_wiki.py" "$LIBRARY" "$PORT" "$LIBRARY_URL" <<'PYEOF'
-import re, sys
-path, library, port, library_url = sys.argv[1:5]
-text = open(path, encoding="utf-8").read()
-text = re.sub(r'^LIBRARY = .*$', f'LIBRARY = {library!r}', text, count=1, flags=re.M)
-text = re.sub(r'^PORT = .*$', f'PORT = {int(port)}', text, count=1, flags=re.M)
-text = re.sub(r'^LIBRARY_URL = .*$', f'LIBRARY_URL = {library_url!r}', text, count=1, flags=re.M)
-open(path, "w", encoding="utf-8").write(text)
-PYEOF
-
 echo
-echo "Installed to $INSTALL_DIR/import_wiki.py"
+echo "Installed to $INSTALL_DIR"
 echo "  LIBRARY      = $LIBRARY"
 echo "  PORT         = $PORT"
 echo "  LIBRARY_URL  = $LIBRARY_URL"
@@ -91,7 +113,7 @@ echo
 if confirm "Set up a systemd service so this runs automatically?"; then
     if [ "$(id -u)" -ne 0 ]; then
         echo "Installing a systemd unit needs root. Skipping -- run it manually with:"
-        echo "  python3 $INSTALL_DIR/import_wiki.py"
+        echo "  WTC_LIBRARY=$LIBRARY WTC_PORT=$PORT WTC_LIBRARY_URL=$LIBRARY_URL python3 $INSTALL_DIR/import_wiki.py"
     else
         cat > /etc/systemd/system/wiki-to-calibre.service <<EOF
 [Unit]
@@ -102,6 +124,9 @@ After=network.target
 Type=simple
 User=root
 WorkingDirectory=$INSTALL_DIR
+Environment=WTC_LIBRARY=$LIBRARY
+Environment=WTC_PORT=$PORT
+Environment=WTC_LIBRARY_URL=$LIBRARY_URL
 ExecStart=/usr/bin/python3 $INSTALL_DIR/import_wiki.py
 Restart=on-failure
 RestartSec=5
@@ -111,11 +136,12 @@ WantedBy=multi-user.target
 EOF
         systemctl daemon-reload
         systemctl enable -q --now wiki-to-calibre
+        systemctl restart wiki-to-calibre
         echo "Service started. Check it with: systemctl status wiki-to-calibre"
     fi
 else
     echo "Skipping systemd setup -- run it manually with:"
-    echo "  python3 $INSTALL_DIR/import_wiki.py"
+    echo "  WTC_LIBRARY=$LIBRARY WTC_PORT=$PORT WTC_LIBRARY_URL=$LIBRARY_URL python3 $INSTALL_DIR/import_wiki.py"
 fi
 
 echo

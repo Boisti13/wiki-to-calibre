@@ -29,6 +29,10 @@ on top.
 - A catalog view of everything imported, with per-article delete
 - Per-article and bulk "refresh" (re-fetch + re-convert in place), remembering
   each article's image/reference options from its original import
+- An About section showing the current version number plus exactly which
+  branch and commit is running, with a "Check for updates" button and an
+  "Update now" button that pulls the latest code for whichever branch you're
+  on and restarts itself — no SSH session required for routine updates
 
 ## Requirements
 
@@ -36,40 +40,46 @@ on top.
 - Calibre installed with `ebook-convert` and `calibredb` on `PATH`
 - A Calibre library (a folder containing `metadata.db`, created automatically
   on first import if it doesn't exist yet)
+- `git` — the installer clones the repo into place rather than dropping a
+  standalone script, so the in-app "Check for updates" / "Update now"
+  buttons have something to pull from
 
 ## Quick install
 
-Interactive installer — checks for Python/Calibre (offers to `apt install`
-calibre if missing), asks for your library path/port, and optionally sets up
-a systemd service:
+Interactive installer — checks for Python/git/Calibre (offers to `apt
+install` what's missing), asks for your library path/port, clones the repo
+into an install directory, and optionally sets up a systemd service:
 
 ```bash
-bash -c "$(curl -fsSL https://raw.githubusercontent.com/Boisti13/wiki-to-calibre/master/install.sh)"
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/Boisti13/wiki-to-calibre/main/install.sh)"
 ```
 
-Or clone the repo first and run `./install.sh` locally — it detects the local
-`import_wiki.py` and uses that instead of fetching it from GitHub.
+Or clone the repo first and run `./install.sh` locally — it copies your
+local clone into place instead of cloning from GitHub again. Re-running the
+installer against an existing install pulls the latest commit on whichever
+branch is already deployed and restarts the service.
 
 ## Manual setup
 
-Edit the three constants at the top of `import_wiki.py`:
-
-```python
-LIBRARY = "/path/to/your/calibre/library"
-PORT = 8084
-LIBRARY_URL = "http://your-calibre-web-host:8083"  # cosmetic, used in success links
-```
-
-Then run it:
+`LIBRARY`, `PORT`, and `LIBRARY_URL` are read from the environment
+(`WTC_LIBRARY`, `WTC_PORT`, `WTC_LIBRARY_URL`), falling back to the defaults
+at the top of `import_wiki.py` if unset. Environment variables, not edits to
+the source file, are the intended way to configure a git-checkout install —
+the "Update now" button does a `git reset --hard`, which would otherwise
+wipe any values hand-edited into the tracked file.
 
 ```bash
+WTC_LIBRARY=/path/to/your/calibre/library \
+WTC_PORT=8084 \
+WTC_LIBRARY_URL=http://your-calibre-web-host:8083 \
 python3 import_wiki.py
 ```
 
 Open `http://localhost:8084`, paste an article URL, and import.
 
-To run it as a systemd service, point a unit's `ExecStart` at
-`python3 /path/to/import_wiki.py`.
+To run it as a systemd service, set the three `Environment=` lines in the
+unit and point `ExecStart` at `python3 /path/to/import_wiki.py` (this is
+exactly what `install.sh` generates).
 
 ## Licensing
 

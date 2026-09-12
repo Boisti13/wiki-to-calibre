@@ -6,15 +6,22 @@ import os
 import re
 import subprocess
 import tempfile
+import threading
 import urllib.parse
 import urllib.request
 from html.parser import HTMLParser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-LIBRARY = "/opt/cwa/library"
-PORT = 8084
-LIBRARY_URL = "http://192.168.178.38:8083"
+# Overridable via environment (set by install.sh in the systemd unit) rather
+# than edited in place here -- "Update now" does a `git reset --hard`, which
+# would otherwise wipe any site-specific values that differ from whatever
+# happens to be committed.
+LIBRARY = os.environ.get("WTC_LIBRARY", "/opt/cwa/library")
+PORT = int(os.environ.get("WTC_PORT", "8084"))
+LIBRARY_URL = os.environ.get("WTC_LIBRARY_URL", "http://192.168.178.38:8083")
 UA = "WikiToCalibre/1.0 (self-hosted homelab tool)"
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+GITHUB_URL = "https://github.com/Boisti13/wiki-to-calibre"
 
 # Wikipedia/Parsoid chrome that reads badly in an ebook. "infobox" is deliberately
 # NOT in here -- the quick-facts table is kept, just stripped of its lead image
@@ -463,50 +470,236 @@ def refresh_all_articles():
     return ok, failed
 
 
-PAGE = """<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Import Wikipedia Article</title>
-<style>body{{font-family:sans-serif;max-width:640px;margin:40px auto;padding:0 16px}}
-input[type=url]{{width:100%;padding:8px;font-size:16px;box-sizing:border-box}}
-button{{padding:8px 16px;font-size:16px;margin-top:8px}}
-pre{{white-space:pre-wrap;background:#f4f4f4;padding:8px;font-size:12px}}
-table.catalog{{width:100%;border-collapse:collapse;margin-top:12px;font-size:14px}}
-table.catalog th,table.catalog td{{padding:6px 4px;border-bottom:1px solid #ddd;text-align:left}}
-table.catalog td.actions{{text-align:right;white-space:nowrap}}
-button.del{{background:none;border:none;color:#c00;cursor:pointer;font-size:13px;padding:2px 6px}}
-button.del:hover{{text-decoration:underline}}
-button.refresh{{background:none;border:none;color:#06c;cursor:pointer;font-size:13px;padding:2px 6px}}
-button.refresh:hover{{text-decoration:underline}}
-.catalog-header{{display:flex;justify-content:space-between;align-items:baseline;margin-top:24px;flex-wrap:wrap;gap:8px}}
-.bulk-actions button{{font-size:13px;padding:4px 10px;margin-top:0;margin-left:6px}}
-.bulk-actions button.del-all,.bulk-actions button.del-sel{{color:#c00;border-color:#c00}}
-.options{{margin-top:8px;font-size:14px;color:#444}}
-.options label{{margin-right:16px;white-space:nowrap}}
-.options input{{margin-right:4px}}
+# --- Version / self-update -------------------------------------------------
+#
+# Mirrors the pattern used in github.com/Boisti13/pto-tracker: a plain-text
+# VERSION file for the human-facing number, plus `git` itself as the source
+# of truth for exactly what's running (branch/commit/subject). Only works
+# when this checkout is an actual git clone -- a script dropped in place
+# without its .git directory just shows the version number, if any, with
+# no update controls.
+
+def _run_git(args, timeout=30):
+    """Runs git in APP_DIR. No user input ever reaches this -- every call site
+    passes a fixed argument list, never anything from a request."""
+    try:
+        result = subprocess.run(
+            ["git"] + args, cwd=APP_DIR, capture_output=True, text=True, timeout=timeout
+        )
+        return result.returncode == 0, (result.stdout or "") + (result.stderr or "")
+    except (subprocess.SubprocessError, OSError) as e:
+        return False, str(e)
+
+
+def _read_version_file():
+    try:
+        with open(os.path.join(APP_DIR, "VERSION")) as f:
+            return f.read().strip() or None
+    except OSError:
+        return None
+
+
+def _get_app_version():
+    version = _read_version_file()
+    if not os.path.isdir(os.path.join(APP_DIR, ".git")):
+        return {"version": version, "branch": None, "commit": None, "message": ""}
+    ok, commit = _run_git(["rev-parse", "--short", "HEAD"])
+    if not ok:
+        return {"version": version, "branch": None, "commit": None, "message": ""}
+    _, branch = _run_git(["rev-parse", "--abbrev-ref", "HEAD"])
+    _, message = _run_git(["log", "-1", "--pretty=%s"])
+    return {"version": version, "branch": branch.strip(), "commit": commit.strip(), "message": message.strip()}
+
+
+# Computed once at process start -- there's no reloader here, "Update now"
+# restarts the whole process, so this is always accurate for whatever code
+# is actually running, without shelling out to git on every page load.
+APP_VERSION = _get_app_version()
+
+
+def check_for_update():
+    """Returns (category, message) for display in the About card. Never raises."""
+    if APP_VERSION["commit"] is None:
+        return "error", "Not a git checkout -- can't check for updates."
+    branch = APP_VERSION["branch"]
+    ok, out = _run_git(["fetch", "origin", branch])
+    if not ok:
+        return "error", "Could not reach GitHub to check for updates: " + out[-300:]
+    ok, count_out = _run_git(["rev-list", "--count", f"HEAD..origin/{branch}"])
+    if not ok:
+        return "error", "Could not determine update status: " + count_out[-300:]
+    n = int(count_out.strip() or "0")
+    if n == 0:
+        return "success", "Already up to date."
+    _, log = _run_git(["log", "--oneline", f"HEAD..origin/{branch}"])
+    titles = log.strip().splitlines()
+    summary = " | ".join(titles[:5])
+    if len(titles) > 5:
+        summary += " | …"
+    return "info", f"{n} update{'s' if n != 1 else ''} available on {branch}: {summary}"
+
+
+def apply_update():
+    """Pulls the latest commit for the current branch. Returns (category, message, restarted)."""
+    if APP_VERSION["commit"] is None:
+        return "error", "Not a git checkout -- can't auto-update.", False
+    branch = APP_VERSION["branch"]
+    ok, out = _run_git(["fetch", "origin", branch])
+    if not ok:
+        return "error", "Update failed: could not reach GitHub. " + out[-300:], False
+    ok, count_out = _run_git(["rev-list", "--count", f"HEAD..origin/{branch}"])
+    if not ok:
+        return "error", "Update failed: could not determine update status. " + count_out[-300:], False
+    if int(count_out.strip() or "0") == 0:
+        return "success", "Already up to date -- nothing to do.", False
+    ok, out = _run_git(["reset", "--hard", f"origin/{branch}"])
+    if not ok:
+        return "error", "Update failed while resetting to the latest version. " + out[-300:], False
+    return "success", "Updated — restarting now. Give it a few seconds, then reload.", True
+
+
+def _trigger_restart():
+    # Non-zero exit code, so the systemd unit's `Restart=on-failure` brings
+    # it straight back up running the code just checked out above.
+    os._exit(3)
+
+
+# --- HTML rendering ----------------------------------------------------
+
+PAGE = """<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Wiki to Calibre</title>
+<style>
+:root {{
+  --bg: #f4f5f7;
+  --card: #ffffff;
+  --text: #1f2430;
+  --muted: #6b7280;
+  --accent: #2563eb;
+  --accent-dark: #1d4ed8;
+  --border: #e5e7eb;
+  --danger: #dc2626;
+  --success: #16a34a;
+  --success-bg: #f0fdf4;
+  --success-border: #bbf7d0;
+  --error-bg: #fef2f2;
+  --error-border: #fecaca;
+  --warn: #b45309;
+  --warn-bg: #fffbeb;
+  --warn-border: #fde68a;
+  --info: #1d4ed8;
+  --info-bg: #eff6ff;
+  --info-border: #bfdbfe;
+}}
+@media (prefers-color-scheme: dark) {{
+  :root {{
+    --bg: #14161a;
+    --card: #1e2128;
+    --text: #e5e7eb;
+    --muted: #9ca3af;
+    --accent: #3b82f6;
+    --accent-dark: #60a5fa;
+    --border: #2e323b;
+    --danger: #f87171;
+    --success: #4ade80;
+    --success-bg: #16281d;
+    --success-border: #14532d;
+    --error-bg: #3a1d1f;
+    --error-border: #7f1d1d;
+    --warn: #fbbf24;
+    --warn-bg: #3a2e10;
+    --warn-border: #78350f;
+    --info: #60a5fa;
+    --info-bg: #1e293b;
+    --info-border: #334155;
+  }}
+}}
+* {{ box-sizing: border-box; }}
+body {{
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  margin: 0;
+}}
+.wrap {{ max-width: 720px; margin: 0 auto; padding: 32px 16px 64px; }}
+h1 {{ font-size: 1.5rem; margin: 0 0 20px; }}
+h2 {{ font-size: 1.1rem; margin: 0 0 14px; }}
+.card {{ background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 20px; margin-bottom: 20px; }}
+.muted {{ color: var(--muted); font-size: 0.85rem; }}
+input[type=url] {{
+  width: 100%; padding: 9px 10px; font-size: 15px;
+  border: 1px solid var(--border); border-radius: 6px;
+  background: var(--bg); color: var(--text);
+}}
+.options {{ margin-top: 12px; font-size: 0.85rem; color: var(--muted); display: flex; gap: 18px; flex-wrap: wrap; }}
+.options label {{ display: inline-flex; align-items: center; gap: 5px; white-space: nowrap; }}
+.btn {{
+  display: inline-block; background: var(--accent); color: #fff; border: none;
+  padding: 9px 16px; border-radius: 6px; font-size: 0.9rem; cursor: pointer;
+}}
+.btn:hover {{ background: var(--accent-dark); }}
+.btn.secondary {{ background: transparent; color: var(--accent); border: 1px solid var(--border); }}
+.btn.danger {{ background: transparent; color: var(--danger); border: 1px solid var(--border); }}
+.btn-row {{ margin-top: 16px; display: flex; gap: 8px; flex-wrap: wrap; }}
+.btn-row form {{ margin: 0; }}
+button.link {{ background: none; border: none; cursor: pointer; font-size: 0.82rem; padding: 2px 6px; }}
+button.link.del {{ color: var(--danger); }}
+button.link.refresh {{ color: var(--accent); }}
+button.link:hover {{ text-decoration: underline; }}
+.catalog-header {{ display: flex; justify-content: space-between; align-items: baseline; flex-wrap: wrap; gap: 8px 16px; }}
+table.catalog {{ width: 100%; border-collapse: collapse; margin-top: 14px; font-size: 0.88rem; }}
+table.catalog th, table.catalog td {{ padding: 8px 6px; border-bottom: 1px solid var(--border); text-align: left; }}
+table.catalog td.actions {{ text-align: right; white-space: nowrap; }}
+.msg {{ padding: 10px 14px; border-radius: 6px; margin-top: 16px; font-size: 0.9rem; }}
+.msg.success {{ background: var(--success-bg); color: var(--success); border: 1px solid var(--success-border); }}
+.msg.error {{ background: var(--error-bg); color: var(--danger); border: 1px solid var(--error-border); }}
+.msg.warn {{ background: var(--warn-bg); color: var(--warn); border: 1px solid var(--warn-border); }}
+.msg.info {{ background: var(--info-bg); color: var(--info); border: 1px solid var(--info-border); }}
+.msg pre {{ white-space: pre-wrap; margin: 8px 0 0; font-size: 0.78rem; background: none; padding: 0; }}
+pre {{ white-space: pre-wrap; background: var(--bg); padding: 8px; font-size: 0.75rem; border-radius: 6px; }}
+code {{ background: var(--bg); padding: 1px 5px; border-radius: 4px; font-size: 0.85em; }}
 </style>
 </head><body>
-<h2>Import Wikipedia Article</h2>
+<div class="wrap">
+<h1>Wiki to Calibre</h1>
+
+<div class="card">
+<h2>Import an article</h2>
 <form method="POST" action="/import">
 <input type="url" name="url" placeholder="https://en.wikipedia.org/wiki/..." required autofocus>
 <div class="options">
 <label><input type="checkbox" name="include_images"> Include pictures</label>
 <label><input type="checkbox" name="include_references"> Include references/sources</label>
 </div>
-<button type="submit">Import</button>
+<div class="btn-row"><button class="btn" type="submit">Import</button></div>
 </form>
 {message}
+</div>
+
+<div class="card">
 <form method="POST" action="/refresh_all" id="catalogForm">
 <div class="catalog-header">
-<h3>Imported Articles ({count})</h3>
-<div class="bulk-actions">
-<button type="submit" formaction="/bulk_refresh" onclick="return confirm('Update the selected articles?')">Update Selected</button>
-<button type="submit" formaction="/bulk_delete" class="del-sel" onclick="return confirm('Delete the selected articles?')">Delete Selected</button>
-<button type="submit" formaction="/refresh_all" onclick="return confirm('Update ALL {count} articles? This may take a while.')">Update All</button>
-<button type="submit" formaction="/delete_all" class="del-all" onclick="return confirm('Delete ALL {count} articles? This cannot be undone.')">Delete All</button>
+<h2>Imported Articles ({count})</h2>
+<div class="btn-row">
+<button type="submit" formaction="/bulk_refresh" class="btn secondary" onclick="return confirm('Update the selected articles?')">Update Selected</button>
+<button type="submit" formaction="/bulk_delete" class="btn danger" onclick="return confirm('Delete the selected articles?')">Delete Selected</button>
+<button type="submit" formaction="/refresh_all" class="btn secondary" onclick="return confirm('Update ALL {count} articles? This may take a while.')">Update All</button>
+<button type="submit" formaction="/delete_all" class="btn danger" onclick="return confirm('Delete ALL {count} articles? This cannot be undone.')">Delete All</button>
 </div>
 </div>
 {catalog}
 </form>
+</div>
+
+{about}
+</div>
 </body></html>"""
+
+
+def _msg(category, body_html):
+    if not body_html:
+        return ""
+    return f'<div class="msg {category}">{body_html}</div>'
 
 
 def render_catalog():
@@ -525,8 +718,8 @@ def render_catalog():
             f"<td>{date}</td>"
             f"<td>{size}</td>"
             '<td class="actions">'
-            f'<button type="submit" formaction="/refresh" name="id" value="{r["id"]}" class="refresh">Refresh</button> '
-            f'<button type="submit" formaction="/delete" name="id" value="{r["id"]}" class="del" '
+            f'<button type="submit" formaction="/refresh" name="id" value="{r["id"]}" class="link refresh">Refresh</button> '
+            f'<button type="submit" formaction="/delete" name="id" value="{r["id"]}" class="link del" '
             'onclick="return confirm(\'Delete this article?\')">Delete</button>'
             "</td>"
             "</tr>"
@@ -542,9 +735,50 @@ def render_catalog():
     return table, len(rows)
 
 
-def render_page(message):
+def render_about(about_message=""):
+    v = APP_VERSION
+    version_line = f"Version <strong>{html.escape(v['version'])}</strong>" if v["version"] else ""
+    if v["commit"]:
+        sep = " &middot; " if version_line else ""
+        subject = f" &mdash; {html.escape(v['message'])}" if v["message"] else ""
+        version_line += (
+            f"{sep}Running <strong>{html.escape(v['branch'])}</strong> "
+            f"@ <code>{html.escape(v['commit'])}</code>{subject}"
+        )
+    elif not v["version"]:
+        version_line = "Not installed from a git checkout &mdash; updates aren't available here."
+
+    update_controls = ""
+    if v["commit"]:
+        branch_js = html.escape(json.dumps(v["branch"] or ""), quote=True)
+        update_controls = (
+            '<div class="btn-row">'
+            '<form method="POST" action="/update/check#about">'
+            '<button class="btn secondary" type="submit">Check for updates</button>'
+            "</form>"
+            '<form method="POST" action="/update/apply#about" '
+            "onsubmit=\"return confirm('Pull the latest ' + " + branch_js + " + "
+            "' and restart the service now? The app will be briefly unavailable while it restarts.');\">"
+            '<button class="btn" type="submit">Update now</button>'
+            "</form>"
+            "</div>"
+        )
+
+    return (
+        '<div class="card" id="about">'
+        "<h2>About</h2>"
+        f'<p class="muted"><a href="{GITHUB_URL}" target="_blank" rel="noopener">wiki-to-calibre on GitHub</a></p>'
+        f'<p class="muted" style="margin-top:8px">{version_line}</p>'
+        f"{about_message}"
+        f"{update_controls}"
+        "</div>"
+    )
+
+
+def render_page(message="", about_message=""):
     catalog_html, count = render_catalog()
-    return PAGE.format(message=message, catalog=catalog_html, count=count)
+    about_html = render_about(about_message)
+    return PAGE.format(message=message, catalog=catalog_html, count=count, about=about_html)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -558,7 +792,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path == "/" or self.path.startswith("/?"):
-            self._send(200, render_page(""))
+            self._send(200, render_page())
         else:
             self._send(404, "Not found")
 
@@ -581,6 +815,12 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/bulk_refresh":
             self._handle_bulk("refresh")
             return
+        if self.path == "/update/check":
+            self._handle_update_check()
+            return
+        if self.path == "/update/apply":
+            self._handle_update_apply()
+            return
         if self.path != "/import":
             self._send(404, "Not found")
             return
@@ -592,24 +832,23 @@ class Handler(BaseHTTPRequestHandler):
         include_references = "include_references" in fields
         try:
             title, warning = import_article(url, include_images, include_references)
-            msg = f'<p style="color:green">Imported &quot;{html.escape(title)}&quot; &mdash; <a href="{LIBRARY_URL}">open library</a></p>'
+            msg = f'Imported &quot;{html.escape(title)}&quot; &mdash; <a href="{LIBRARY_URL}">open library</a>'
             if warning:
-                msg += f'<p style="color:#b8860b">&#9888; {html.escape(warning)}</p>'
-            self._send(200, render_page(msg))
+                msg += f'<p style="margin:8px 0 0">&#9888; {html.escape(warning)}</p>'
+            self._send(200, render_page(_msg("success", msg)))
         except AlreadyImported as e:
             msg = (
-                f'<p style="color:#b8860b">&quot;{html.escape(e.title)}&quot; is already in the library '
+                f'&quot;{html.escape(e.title)}&quot; is already in the library '
                 f'(book #{e.book_id}) &mdash; skipped, nothing re-downloaded. '
-                f'<a href="{LIBRARY_URL}">open library</a></p>'
+                f'<a href="{LIBRARY_URL}">open library</a>'
             )
-            self._send(200, render_page(msg))
+            self._send(200, render_page(_msg("warn", msg)))
         except subprocess.CalledProcessError as e:
             err = (e.stderr or str(e))[-2000:]
-            msg = f'<p style="color:red">Conversion failed:</p><pre>{html.escape(err)}</pre>'
-            self._send(500, render_page(msg))
+            msg = f"Conversion failed:<pre>{html.escape(err)}</pre>"
+            self._send(500, render_page(_msg("error", msg)))
         except Exception as e:
-            msg = f'<p style="color:red">Error: {html.escape(str(e))}</p>'
-            self._send(400, render_page(msg))
+            self._send(400, render_page(_msg("error", f"Error: {html.escape(str(e))}")))
 
     def _handle_delete(self):
         length = int(self.headers.get("Content-Length", 0))
@@ -619,15 +858,13 @@ class Handler(BaseHTTPRequestHandler):
             if not book_id.isdigit() or not is_wikipedia_article(book_id):
                 raise ValueError("Not a Wikipedia import (refusing to delete)")
             delete_article(book_id)
-            msg = '<p style="color:green">Article deleted.</p>'
-            self._send(200, render_page(msg))
+            self._send(200, render_page(_msg("success", "Article deleted.")))
         except subprocess.CalledProcessError as e:
             err = (e.stderr or str(e))[-2000:]
-            msg = f'<p style="color:red">Delete failed:</p><pre>{html.escape(err)}</pre>'
-            self._send(500, render_page(msg))
+            msg = f"Delete failed:<pre>{html.escape(err)}</pre>"
+            self._send(500, render_page(_msg("error", msg)))
         except Exception as e:
-            msg = f'<p style="color:red">Delete failed: {html.escape(str(e))}</p>'
-            self._send(400, render_page(msg))
+            self._send(400, render_page(_msg("error", f"Delete failed: {html.escape(str(e))}")))
 
     def _handle_refresh(self):
         length = int(self.headers.get("Content-Length", 0))
@@ -637,25 +874,21 @@ class Handler(BaseHTTPRequestHandler):
             if not book_id.isdigit() or not is_wikipedia_article(book_id):
                 raise ValueError("Not a Wikipedia import (refusing to refresh)")
             title = refresh_article(book_id)
-            msg = f'<p style="color:green">Refreshed &quot;{html.escape(title)}&quot;</p>'
-            self._send(200, render_page(msg))
+            self._send(200, render_page(_msg("success", f"Refreshed &quot;{html.escape(title)}&quot;")))
         except subprocess.CalledProcessError as e:
             err = (e.stderr or str(e))[-2000:]
-            msg = f'<p style="color:red">Refresh failed:</p><pre>{html.escape(err)}</pre>'
-            self._send(500, render_page(msg))
+            msg = f"Refresh failed:<pre>{html.escape(err)}</pre>"
+            self._send(500, render_page(_msg("error", msg)))
         except Exception as e:
-            msg = f'<p style="color:red">Refresh failed: {html.escape(str(e))}</p>'
-            self._send(400, render_page(msg))
+            self._send(400, render_page(_msg("error", f"Refresh failed: {html.escape(str(e))}")))
 
     def _handle_refresh_all(self):
         ok, failed = refresh_all_articles()
         if failed:
             names = ", ".join(html.escape(t) for t in failed)
-            msg = (
-                f'<p style="color:#b8860b">Updated {ok} article(s), {len(failed)} failed: {names}</p>'
-            )
+            msg = _msg("warn", f"Updated {ok} article(s), {len(failed)} failed: {names}")
         else:
-            msg = f'<p style="color:green">Updated all {ok} article(s).</p>'
+            msg = _msg("success", f"Updated all {ok} article(s).")
         self._send(200, render_page(msg))
 
     def _handle_delete_all(self):
@@ -667,9 +900,9 @@ class Handler(BaseHTTPRequestHandler):
                 ok += 1
             except Exception:
                 failed += 1
-        msg = f'<p style="color:green">Deleted {ok} article(s).</p>'
+        msg = _msg("success", f"Deleted {ok} article(s).")
         if failed:
-            msg += f'<p style="color:red">{failed} failed to delete.</p>'
+            msg += _msg("error", f"{failed} failed to delete.")
         self._send(200, render_page(msg))
 
     def _handle_bulk(self, action):
@@ -677,7 +910,7 @@ class Handler(BaseHTTPRequestHandler):
         body = self.rfile.read(length).decode("utf-8")
         ids = [i for i in urllib.parse.parse_qs(body).get("ids", []) if i.isdigit() and is_wikipedia_article(i)]
         if not ids:
-            self._send(200, render_page('<p style="color:#b8860b">No articles were selected.</p>'))
+            self._send(200, render_page(_msg("warn", "No articles were selected.")))
             return
         ok, failed = 0, []
         for book_id in ids:
@@ -691,10 +924,20 @@ class Handler(BaseHTTPRequestHandler):
                 failed.append(book_id)
         verb = "Deleted" if action == "delete" else "Updated"
         if failed:
-            msg = f'<p style="color:#b8860b">{verb} {ok} article(s), {len(failed)} failed.</p>'
+            msg = _msg("warn", f"{verb} {ok} article(s), {len(failed)} failed.")
         else:
-            msg = f'<p style="color:green">{verb} {ok} selected article(s).</p>'
+            msg = _msg("success", f"{verb} {ok} selected article(s).")
         self._send(200, render_page(msg))
+
+    def _handle_update_check(self):
+        category, text = check_for_update()
+        self._send(200, render_page(about_message=_msg(category, html.escape(text))))
+
+    def _handle_update_apply(self):
+        category, text, should_restart = apply_update()
+        self._send(200, render_page(about_message=_msg(category, html.escape(text))))
+        if should_restart:
+            threading.Timer(1.0, _trigger_restart).start()
 
     def log_message(self, fmt, *args):
         pass
